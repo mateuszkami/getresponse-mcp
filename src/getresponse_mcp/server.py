@@ -448,12 +448,47 @@ def assign_tag_to_contact(contact_id: str, tag_id: str) -> str:
 def remove_tag_from_contact(contact_id: str, tag_id: str) -> str:
     """Remove a tag from a contact.
 
+    GR ma NIE-DELETE'owalne tagi kontaktu (DELETE /contacts/{id}/tags/{id} = 404).
+    Usuniecie dziala przez REPLACE: odczytaj aktualne tagi (GET /contacts/{id}),
+    potem POST /contacts/{id} z pelna lista BEZ usuwanego tagu.
+    Guard: jesli nie da sie odczytac tagow — przerwij, NIE nadpisuj pustym
+    (lekcja z bugfixa 25.05: pusty replace kasuje WSZYSTKIE tagi).
+
     Args:
         contact_id: The contact ID
         tag_id: The tag ID to remove
     """
-    _delete(f"/contacts/{contact_id}/tags/{tag_id}")
-    return json.dumps({"status": "removed", "contact_id": contact_id, "tag_id": tag_id}, indent=2)
+    contact = _get(f"/contacts/{contact_id}")
+    current = contact.get("tags") if isinstance(contact, dict) else None
+    if current is None:
+        return json.dumps(
+            {
+                "status": "error",
+                "reason": "nie udalo sie odczytac tagow kontaktu — przerwano, by nie skasowac wszystkich",
+                "contact_id": contact_id,
+            },
+            indent=2, ensure_ascii=False,
+        )
+    remaining = [
+        {"tagId": t.get("tagId")}
+        for t in current
+        if t.get("tagId") and t.get("tagId") != tag_id
+    ]
+    if len(remaining) == len(current):
+        return json.dumps(
+            {"status": "noop", "reason": "tag nie byl przypisany do kontaktu", "contact_id": contact_id, "tag_id": tag_id},
+            indent=2, ensure_ascii=False,
+        )
+    _post(f"/contacts/{contact_id}", {"tags": remaining})
+    return json.dumps(
+        {
+            "status": "removed",
+            "contact_id": contact_id,
+            "tag_id": tag_id,
+            "remaining_tag_ids": [t["tagId"] for t in remaining],
+        },
+        indent=2, ensure_ascii=False,
+    )
 
 
 # ── Tool 20: List Custom Fields ─────────────────────────────────────
@@ -494,6 +529,70 @@ def create_custom_field(name: str, field_type: str = "text", values: list[str] |
     if values:
         payload["values"] = values
     data = _post("/custom-fields", payload)
+    return json.dumps(data, indent=2, ensure_ascii=False)
+
+
+# ── Tool 22: List Segments ──────────────────────────────────────────
+
+@mcp.tool()
+def list_segments(page: int = 1, per_page: int = 25) -> str:
+    """List all segments (saved search-contacts = segments in the GR app).
+
+    Args:
+        page: Page number (default 1)
+        per_page: Results per page (default 25, max 100)
+    """
+    data = _get("/search-contacts", params={"page": page, "perPage": per_page})
+    results = []
+    for s in data:
+        results.append({
+            "id": s.get("searchContactId"),
+            "name": s.get("name"),
+            "created": s.get("createdOn"),
+        })
+    return json.dumps(results, indent=2, ensure_ascii=False)
+
+
+# ── Tool 23: Create Segment (by tags) ───────────────────────────────
+
+@mcp.tool()
+def create_segment(
+    name: str,
+    tag_ids: list[str],
+    campaign_ids: list[str],
+    match: str = "any",
+    subscribers_type: str = "subscribed",
+) -> str:
+    """Create a segment (saved search) filtering contacts by one or more tags.
+
+    Verified against GR API v3 (search-contacts). Note: campaignIdsList,
+    subscriberCycle and subscriptionDate are REQUIRED by the API.
+
+    Args:
+        name: Segment name (1-128 chars)
+        tag_ids: Tag IDs to match (get them from list_tags)
+        campaign_ids: Campaign/list IDs to search within (required, e.g. ["OjaNL"])
+        match: 'any' = has any of the tags (OR), 'all' = has all tags (AND). Default 'any'
+        subscribers_type: 'subscribed' (default) / 'unconfirmed' / 'undelivered' / 'removed'
+    """
+    logic = "or" if match == "any" else "and"
+    conditions = [
+        {"conditionType": "tag", "value": tid, "operatorType": "exists", "operator": "exists"}
+        for tid in tag_ids
+    ]
+    payload = {
+        "name": name,
+        "subscribersType": [subscribers_type],
+        "sectionLogicOperator": "or",
+        "section": [{
+            "campaignIdsList": campaign_ids,
+            "logicOperator": logic,
+            "subscriberCycle": ["receiving_autoresponder", "not_receiving_autoresponder"],
+            "subscriptionDate": "all_time",
+            "conditions": conditions,
+        }],
+    }
+    data = _post("/search-contacts", payload)
     return json.dumps(data, indent=2, ensure_ascii=False)
 
 
